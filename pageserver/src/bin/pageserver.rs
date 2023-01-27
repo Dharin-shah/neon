@@ -85,6 +85,13 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Initialize logging, which must be initialized before the custom panic hook is installed.
+    logging::init(conf.log_format)?;
+
+    // disable the default rust panic hook by using `set_hook`. sentry will install it's own on top
+    // of this, always processing the panic before we log it.
+    std::panic::set_hook(Box::new(tracing_panic_hook));
+
     // initialize sentry if SENTRY_DSN is provided
     let _sentry_guard = init_sentry(
         Some(GIT_VERSION.into()),
@@ -204,9 +211,6 @@ fn initialize_config(
 }
 
 fn start_pageserver(conf: &'static PageServerConf) -> anyhow::Result<()> {
-    // Initialize logging
-    logging::init(conf.log_format)?;
-
     // Print version to the log, and expose it as a prometheus metric too.
     info!("version: {}", version());
     set_build_info_metric(GIT_VERSION);
@@ -478,6 +482,38 @@ fn cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Show enabled compile time features"),
         )
+}
+
+/// Named symbol for our panic hook, which logs the panic.
+fn tracing_panic_hook(info: &std::panic::PanicInfo) {
+    // following rust 1.66.1 std implementation:
+    // https://github.com/rust-lang/rust/blob/90743e7298aca107ddaa0c202a4d3604e29bfeb6/library/std/src/panicking.rs#L235-L288
+    let location = info.location();
+
+    let msg = match info.payload().downcast_ref::<&'static str>() {
+        Some(s) => *s,
+        None => match info.payload().downcast_ref::<String>() {
+            Some(s) => &s[..],
+            None => "Box<dyn Any>",
+        },
+    };
+
+    let thread = std::thread::current();
+    let thread = thread.name().unwrap_or("<unnamed>");
+    let backtrace = std::backtrace::Backtrace::capture();
+
+    let _entered = if let Some(location) = location {
+            tracing::error_span!("panic", %thread, panic.file = location.file(), panic.line = location.line(), panic.column = location.column())
+        } else {
+            // very unlikely to hit here, but the guarantees of std could change
+            tracing::error_span!("panic", %thread)
+        }.entered();
+
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        tracing::error!("{msg}\n\nStack backtrace:\n{backtrace}");
+    } else {
+        tracing::error!("{msg}");
+    }
 }
 
 #[test]
